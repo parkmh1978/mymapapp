@@ -7,13 +7,13 @@ import plotly.express as px
 
 # 페이지 설정
 st.set_page_config(
-    page_title="주요 기업 주가 현황",
+    page_title="주요 기업 주가 현황", # 페이지 제목 변경
     page_icon="📈",
     layout="wide"
 )
 
-# 시총 Top 10 기업 (2024년 기준) 및 추가 기업
-TOP_COMPANIES = {
+# 분석할 기업 목록 (시총 Top 10 및 추가 기업 포함)
+COMPANIES_TO_ANALYZE = {
     "Apple": "AAPL",
     "Microsoft": "MSFT",
     "Alphabet": "GOOGL",
@@ -38,11 +38,58 @@ TOP_COMPANIES = {
 }
 
 @st.cache_data
+def get_exchange_rate_data(period="3y"):
+    """KRW/USD 환율 데이터를 가져오는 함수"""
+    try:
+        krw_usd = yf.Ticker("KRW=X")
+        # yfinance의 history 함수는 start, end 날짜를 지정하는 것이 더 정확할 수 있습니다.
+        # period를 사용하면 최근 며칠간의 데이터가 누락될 수 있습니다.
+        # 여기서는 period를 그대로 사용하되, 실제 앱에서는 start/end를 고려할 수 있습니다.
+        exchange_data = krw_usd.history(period=period)
+        if not exchange_data.empty:
+            # 환율 데이터의 'Close' 컬럼만 사용
+            return exchange_data['Close'].rename('KRW_USD_Rate')
+        return None
+    except Exception as e:
+        st.error(f"KRW/USD 환율 데이터를 가져오는 중 오류 발생: {e}")
+        return None
+
+@st.cache_data
 def get_stock_data(ticker, period="3y"):
-    """주식 데이터를 가져오는 함수"""
+    """주식 데이터를 가져오는 함수 (한국 주식은 환율 변환 포함)"""
     try:
         stock = yf.Ticker(ticker)
         data = stock.history(period=period)
+
+        if data.empty:
+            return None
+
+        # 한국 주식인 경우 (티커가 .KS로 끝나는 경우) 환율 변환 적용
+        if ticker.endswith(".KS"):
+            exchange_rates = get_exchange_rate_data(period)
+            if exchange_rates is not None and not exchange_rates.empty:
+                # 주식 데이터 인덱스에 맞춰 환율 데이터 정렬 및 누락된 값 채우기 (이전 값으로)
+                # 이 과정은 주식 거래일과 환율 제공일이 다를 수 있기 때문에 중요합니다.
+                aligned_exchange_rates = exchange_rates.reindex(data.index, method='ffill')
+
+                # 환율 데이터가 없는 날짜가 있다면 해당 주식 데이터는 제외
+                data = data.dropna(subset=['Close']) # 주가 데이터에 NaN이 없도록 확인
+                aligned_exchange_rates = aligned_exchange_rates.dropna() # 환율 데이터에 NaN이 없도록 확인
+
+                # 두 데이터프레임의 인덱스를 교집합으로 맞춰서 정확한 매칭
+                common_index = data.index.intersection(aligned_exchange_rates.index)
+                data = data.loc[common_index]
+                aligned_exchange_rates = aligned_exchange_rates.loc[common_index]
+
+                if not data.empty and not aligned_exchange_rates.empty:
+                    # KRW 가격을 USD로 변환
+                    for col in ['Open', 'High', 'Low', 'Close']:
+                        data[col] = data[col] / aligned_exchange_rates
+                    # 거래량은 통화 변환의 대상이 아니므로 그대로 둡니다.
+                else:
+                    st.warning(f"{ticker}에 대한 환율 데이터가 충분하지 않아 변환을 건너뛰었습니다.")
+            else:
+                st.warning(f"KRW/USD 환율 데이터를 가져올 수 없어 {ticker}의 주가가 변환되지 않았습니다.")
         return data
     except Exception as e:
         st.error(f"{ticker} 데이터를 가져오는 중 오류 발생: {e}")
@@ -50,17 +97,36 @@ def get_stock_data(ticker, period="3y"):
 
 @st.cache_data
 def get_company_info(ticker):
-    """회사 정보를 가져오는 함수"""
+    """회사 정보를 가져오는 함수 (한국 기업은 환율 변환 포함)"""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
+        current_price = info.get('currentPrice', 0)
+        market_cap = info.get('marketCap', 0)
+
+        # 한국 주식인 경우 현재 가격과 시가총액을 USD로 변환
+        if ticker.endswith(".KS"):
+            krw_usd = yf.Ticker("KRW=X")
+            # 최신 환율을 가져오기 위해 "1d" 기간 사용
+            exchange_data = krw_usd.history(period="1d")
+            if not exchange_data.empty:
+                latest_rate = exchange_data['Close'].iloc[-1]
+                if latest_rate > 0:
+                    current_price = current_price / latest_rate
+                    market_cap = market_cap / latest_rate
+                else:
+                    st.warning(f"유효한 최신 KRW/USD 환율(0이하)을 가져올 수 없어 {ticker}의 가격이 변환되지 않았습니다.")
+            else:
+                st.warning(f"최신 KRW/USD 환율 데이터를 가져올 수 없어 {ticker}의 가격이 변환되지 않았습니다.")
+
         return {
             'name': info.get('longName', 'N/A'),
             'sector': info.get('sector', 'N/A'),
-            'marketCap': info.get('marketCap', 0),
-            'currentPrice': info.get('currentPrice', 0)
+            'marketCap': market_cap,
+            'currentPrice': current_price
         }
-    except:
+    except Exception as e:
+        st.error(f"{ticker} 회사 정보를 가져오는 중 오류 발생: {e}")
         return {'name': 'N/A', 'sector': 'N/A', 'marketCap': 0, 'currentPrice': 0}
 
 def format_market_cap(market_cap):
@@ -75,15 +141,15 @@ def format_market_cap(market_cap):
         return f"${market_cap:,.0f}"
 
 def main():
-    st.title("📈 주요 기업 주가 현황")
-    st.markdown("최근 주가 데이터를 확인해보세요.")
+    st.title("📈 주요 기업 주가 현황") # 제목 변경
+    st.markdown("최근 주가 데이터를 확인해보세요.") # 설명 변경
 
     # 사이드바에서 기업 선택
     st.sidebar.header("기업 선택")
     selected_companies = st.sidebar.multiselect(
         "분석할 기업을 선택하세요:",
-        options=list(TOP_COMPANIES.keys()),
-        default=["Apple", "Samsung Electronics", "NVIDIA"]  # 기본으로 몇 개 선택
+        options=list(COMPANIES_TO_ANALYZE.keys()), # 변경된 딕셔너리 사용
+        default=["Apple", "Samsung Electronics", "NVIDIA"]  # 기본 선택 기업 조정
     )
 
     if not selected_companies:
@@ -97,7 +163,7 @@ def main():
         "3년": "3y",
         "5년": "5y",
         "10년": "10y", # 10년 옵션 추가
-        "최대": "max" # 최대 옵션 추가
+        "최대": "max"  # 최대 옵션 추가
     }
 
     selected_period = st.sidebar.selectbox(
@@ -118,7 +184,7 @@ def main():
         company_info = {}
 
         for company in selected_companies:
-            ticker = TOP_COMPANIES[company]
+            ticker = COMPANIES_TO_ANALYZE[company] # 변경된 딕셔너리 사용
             data = get_stock_data(ticker, period_options[selected_period])
             info = get_company_info(ticker)
 
